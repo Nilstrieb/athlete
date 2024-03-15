@@ -10,6 +10,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tracing::info;
 
 use crate::util;
 
@@ -215,6 +216,27 @@ impl Client {
             .write_blob(&manifest.config.digest, &config_blob)
             .await?;
 
+        for layer in manifest.layers {
+            if !writer.already_exists(&layer.digest).await? {
+                info!(
+                    "{} Downloading... ({})",
+                    layer.digest,
+                    humansize::format_size(layer.size, humansize::DECIMAL)
+                );
+
+                let content = self
+                    .get_blob(image, &layer.digest)
+                    .await
+                    .wrap_err("getting layer")?;
+                writer
+                    .write_blob(&layer.digest, &content)
+                    .await
+                    .wrap_err("writing blob")?;
+            } else {
+                info!("{} Skipping", layer.digest);
+            }
+        }
+
         Ok(())
     }
 }
@@ -276,6 +298,7 @@ pub struct OciImageConfigConfig {
     // tty: bool,
 }
 
+#[derive(Clone)]
 pub struct ImageLayoutWriter {
     // look, this could be a `Dir`` but that's too annoying right now
     dir: PathBuf,
@@ -299,6 +322,22 @@ impl ImageLayoutWriter {
         util::write_file(dir.join("index.json"), &index).await?;
 
         Ok(Self { dir })
+    }
+
+    pub async fn already_exists(&self, digest: &str) -> Result<bool> {
+        let (alg, encoded) = digest
+            .split_once(":")
+            .wrap_err_with(|| format!("digest {digest} does not have ALG:ENCODED format"))?;
+        let blob = self.dir.join("blobs").join(alg).join(encoded);
+        let content = fs::read(blob).await;
+        Ok(match content {
+            Ok(content) => {
+                let digest = util::digest(alg, content).await?;
+                // if the digest doesn't match, try again.
+                digest.eq_ignore_ascii_case(encoded)
+            }
+            _ => false,
+        })
     }
 
     pub async fn write_blob(&self, digest: &str, blob_content: &[u8]) -> Result<()> {
